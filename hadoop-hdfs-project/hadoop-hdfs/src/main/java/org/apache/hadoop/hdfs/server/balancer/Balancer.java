@@ -44,6 +44,8 @@ import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -59,9 +61,13 @@ import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferEncryptor;
 import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
 import org.apache.hadoop.hdfs.protocol.datatransfer.Sender;
@@ -92,11 +98,13 @@ import org.apache.hadoop.util.ToolRunner;
  * <p>SYNOPSIS
  * <pre>
  * To start:
- *      bin/start-balancer.sh [-threshold <threshold>]
+ *      bin/start-balancer.sh [-threshold <threshold>] [-exclude </path>]
  *      Example: bin/ start-balancer.sh 
  *                     start the balancer with a default threshold of 10%
  *               bin/ start-balancer.sh -threshold 5
  *                     start the balancer with a threshold of 5%
+ *               bin/ start-balancer.sh -exclude /hbase
+ *                     start the balancer without touching /hbase blocks
  * To stop:
  *      bin/ stop-balancer.sh
  * </pre>
@@ -197,11 +205,15 @@ public class Balancer {
       + "\n\t[-policy <policy>]\tthe balancing policy: "
       + BalancingPolicy.Node.INSTANCE.getName() + " or "
       + BalancingPolicy.Pool.INSTANCE.getName()
-      + "\n\t[-threshold <threshold>]\tPercentage of disk capacity";
+      + "\n\t[-threshold <threshold>]\tPercentage of disk capacity"
+      + "\n\t[-exclude </path>]\tDon't touch blocks under the given path";
   
   private final NameNodeConnector nnc;
   private final BalancingPolicy policy;
   private final double threshold;
+  private final String excludePath;
+  private Set<Block> excludeBlocks = new HashSet<Block>();
+  private long excludeBlocksLastRefreshTime = 0;
   
   // all data node lists
   private Collection<Source> overUtilizedDatanodes
@@ -829,6 +841,7 @@ public class Balancer {
     this.threshold = p.threshold;
     this.policy = p.policy;
     this.nnc = theblockpool;
+    this.excludePath = p.excludePath;
     cluster = NetworkTopology.getInstance(conf);
   }
   
@@ -1209,6 +1222,7 @@ public class Balancer {
    * 1. the block is not in the process of being moved/has not been moved;
    * 2. the block does not have a replica on the target;
    * 3. doing the move does not reduce the number of racks that the block has
+   * 4. the block is not in our excludeBlocks list
    */
   private boolean isGoodBlockCandidate(Source source, 
       BalancerDatanode target, BalancerBlock block) {
@@ -1217,6 +1231,9 @@ public class Balancer {
         return false;
     }
     if (block.isLocatedOnDatanode(target)) {
+      return false;
+    }
+    if (excludeBlocks != null && excludeBlocks.contains(block.getBlock())) {
       return false;
     }
     if (cluster.isNodeGroupAware() && 
@@ -1292,6 +1309,56 @@ public class Balancer {
     this.movedBlocks.cleanup();
   }
   
+  private void refreshExcludeBlocks() throws IOException{
+    long enumerate_starts = Time.now();
+
+    LOG.info("Build exclude blocks set");
+
+    Set<Block> newBlocks = new HashSet<Block>();
+    Queue<String> parents = new LinkedList<String>();
+
+    parents.add(excludePath);
+
+    while (!parents.isEmpty()) {
+      String dir = parents.poll();
+      byte[] start = HdfsFileStatus.EMPTY_NAME;
+
+      do {
+        DirectoryListing listing = nnc.client.getListing(dir, start, false);
+        if (listing == null)
+          break;
+        HdfsFileStatus[] status = listing.getPartialListing();
+        LOG.debug("Enumerated " + status.length + " entries in " + dir);
+        for (int i = 0; i < status.length; i++) {
+          String fullName = status[i].getFullName(dir);
+          if (status[i].isDir()) {
+            // enqueue for process
+            parents.add(fullName);
+          }
+          else if (status[i].getModificationTime() > excludeBlocksLastRefreshTime) {
+            // remember block list
+            LocatedBlocks blocks = nnc.client.getBlockLocations (fullName, 0, status[i].getLen());
+            if (blocks != null) {
+              for (LocatedBlock lb : blocks.getLocatedBlocks()) {
+                newBlocks.add(lb.getBlock().getLocalBlock());
+              }
+            }
+          }
+        }
+        if (!listing.hasMore()) {
+          break;
+        }
+        start = status[status.length-1].getLocalNameInBytes();
+      }
+      while (true);
+    }
+
+    LOG.info("Enumerated " + newBlocks.size() + " modified blocks");
+    excludeBlocks.addAll(newBlocks);
+    LOG.info("Now we have " + excludeBlocks.size() + " blocks in exclude set");
+    excludeBlocksLastRefreshTime = enumerate_starts;
+  }
+
   /* Remove all blocks from the global block list except for the ones in the
    * moved list.
    */
@@ -1366,6 +1433,11 @@ public class Balancer {
             + " to make the cluster balanced." );
       }
       
+      // obtain blocks from exclude path (if any)
+      if (excludePath != null) {
+        refreshExcludeBlocks ();
+      }
+
       /* Decide all the nodes that will participate in the block move and
        * the number of bytes that need to be moved from one node to another
        * in this iteration. Maximum bytes to be moved per node is
@@ -1490,20 +1562,24 @@ public class Balancer {
 
   static class Parameters {
     static final Parameters DEFALUT = new Parameters(
-        BalancingPolicy.Node.INSTANCE, 10.0);
+        BalancingPolicy.Node.INSTANCE, 10.0, null);
 
     final BalancingPolicy policy;
     final double threshold;
+    final String excludePath;
 
-    Parameters(BalancingPolicy policy, double threshold) {
+    Parameters(BalancingPolicy policy, double threshold, String excludePath) {
       this.policy = policy;
       this.threshold = threshold;
+      this.excludePath = excludePath;
     }
 
     @Override
     public String toString() {
       return Balancer.class.getSimpleName() + "." + getClass().getSimpleName()
-          + "[" + policy + ", threshold=" + threshold + "]";
+          + "[" + policy + ", threshold=" + threshold
+          + ((excludePath == null) ? "" : (", exclude=" + excludePath))
+          + "]";
     }
   }
 
@@ -1542,6 +1618,7 @@ public class Balancer {
     static Parameters parse(String[] args) {
       BalancingPolicy policy = Parameters.DEFALUT.policy;
       double threshold = Parameters.DEFALUT.threshold;
+      String excludePath = Parameters.DEFALUT.excludePath;
 
       if (args != null) {
         try {
@@ -1570,6 +1647,14 @@ public class Balancer {
                 System.err.println("Illegal policy name: " + args[i]);
                 throw e;
               }
+            } else if ("-exclude".equalsIgnoreCase(args[i])) {
+              i++;
+              if (args[i].charAt(0) != '/') {
+                System.err.println("Exclude path must be absolute");
+                throw new IllegalArgumentException("Invalid exclude path " + args[i]);
+              }
+              excludePath = args[i];
+              LOG.info("Blocks in " + excludePath + " will be excluded from move");
             } else {
               throw new IllegalArgumentException("args = "
                   + Arrays.toString(args));
@@ -1581,7 +1666,7 @@ public class Balancer {
         }
       }
       
-      return new Parameters(policy, threshold);
+      return new Parameters(policy, threshold, excludePath);
     }
 
     private static void printUsage(PrintStream out) {
