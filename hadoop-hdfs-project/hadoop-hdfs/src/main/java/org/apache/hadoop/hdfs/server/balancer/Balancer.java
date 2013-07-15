@@ -226,13 +226,9 @@ public class Balancer {
                  = new HashMap<String, BalancerDatanode>();
   
   private NetworkTopology cluster;
-  final static private int MOVER_THREAD_POOL_SIZE = 1000;
-  final private ExecutorService moverExecutor = 
-    Executors.newFixedThreadPool(MOVER_THREAD_POOL_SIZE);
-  final static private int DISPATCHER_THREAD_POOL_SIZE = 200;
-  final private ExecutorService dispatcherExecutor =
-    Executors.newFixedThreadPool(DISPATCHER_THREAD_POOL_SIZE);
-  
+
+  private ExecutorService moverExecutor = null;
+  private ExecutorService dispatcherExecutor = null;
 
   /* This class keeps track of a scheduled block move */
   private class PendingBlockMove {
@@ -830,6 +826,9 @@ public class Balancer {
     this.policy = p.policy;
     this.nnc = theblockpool;
     cluster = NetworkTopology.getInstance(conf);
+
+    moverExecutor = Executors.newFixedThreadPool(conf.getInt("dfs.balancer.moverThreads", 1000));
+    dispatcherExecutor = Executors.newFixedThreadPool(conf.getInt("dfs.balancer.dispatcherThreads", 200));
   }
   
   /* Shuffle datanode array */
@@ -1428,7 +1427,7 @@ public class Balancer {
         DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_DEFAULT);
     LOG.info("namenodes = " + namenodes);
     LOG.info("p         = " + p);
-    
+
     final Formatter formatter = new Formatter(System.out);
     System.out.println("Time Stamp               Iteration#  Bytes Already Moved  Bytes Left To Move  Bytes Being Moved");
     
