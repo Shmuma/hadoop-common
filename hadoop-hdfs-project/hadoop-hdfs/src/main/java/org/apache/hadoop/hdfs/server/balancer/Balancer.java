@@ -227,8 +227,8 @@ public class Balancer {
   
   private NetworkTopology cluster;
 
-  private ExecutorService moverExecutor = null;
-  private ExecutorService dispatcherExecutor = null;
+  private final ExecutorService moverExecutor;
+  private final ExecutorService dispatcherExecutor;
 
   /* This class keeps track of a scheduled block move */
   private class PendingBlockMove {
@@ -827,8 +827,12 @@ public class Balancer {
     this.nnc = theblockpool;
     cluster = NetworkTopology.getInstance(conf);
 
-    moverExecutor = Executors.newFixedThreadPool(conf.getInt("dfs.balancer.moverThreads", 1000));
-    dispatcherExecutor = Executors.newFixedThreadPool(conf.getInt("dfs.balancer.dispatcherThreads", 200));
+    this.moverExecutor = Executors.newFixedThreadPool(
+            conf.getInt(DFSConfigKeys.DFS_BALANCER_MOVERTHREADS_KEY,
+                        DFSConfigKeys.DFS_BALANCER_MOVERTHREADS_DEFAULT));
+    this.dispatcherExecutor = Executors.newFixedThreadPool(
+            conf.getInt(DFSConfigKeys.DFS_BALANCER_DISPATCHERTHREADS_KEY,
+                        DFSConfigKeys.DFS_BALANCER_DISPATCHERTHREADS_DEFAULT));
   }
   
   /* Shuffle datanode array */
